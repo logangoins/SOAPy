@@ -85,8 +85,9 @@ def getAccountDN(
     return dn
 
 
-def set_spn(
+def set_array_attribute(
     target: str,
+    attr: str,
     value: str,
     username: str,
     ip: str,
@@ -94,32 +95,34 @@ def set_spn(
     auth: NTLMAuth,
     remove: bool = False,
 ):
-    """Set a value in servicePrincipalName. Appends value to the 
-    attribute rather than replacing.
+    """Set a value in AD attribute that has isSingleValued=False
+        (e.g. servicePrincipalName, altSecurityIdentities).
+        Appends value to the attribute rather than replacing.
 
     Args:
         target (str): target samAccountName
-        value (str): value to append to the targets servicePrincipalName
+        attr (str): name of attribute to modify
+        value (str): value to append to the target's attribute
         username (str): user to authenticate as
         ip (str): the ip of the domain controller
         auth (NTLMAuth): authentication method
         remove (bool): Whether to remove the value
     """
 
-    dn = getAccountDN(target=target,username=username,ip=ip,domain=domain,auth=auth)
+    dn = getAccountDN(target=target, username=username, ip=ip, domain=domain, auth=auth)
     
     put_client = ADWSConnect.put_client(ip, domain, username, auth)
     
     put_client.put(
         object_ref=dn,
         operation="add" if not remove else "delete",
-        attribute="addata:servicePrincipalName",
+        attribute=f"addata:{attr}",
         data_type="string",
         value=value,
     )
         
     print(
-        f"[+] servicePrincipalName {value} {'removed' if remove else 'written'} successfully on {target}!"
+        f"[+] {attr} {value} {'removed' if remove else 'written'} successfully on {target}!"
     )
 
 def set_asrep(
@@ -413,6 +416,12 @@ github.com/jlevere
         help="Operation to write or remove RBCD. Also used to pass in the source computer account used for the attack.",
     )
     writing.add_argument(
+        "--altsecid",
+        action="store",
+        metavar="value",
+        help='Operation to write the altSecurityIdentities attribute value, writes by default unless "--remove" is specified',
+    )
+    writing.add_argument(
         "--spn",
         action="store",
         metavar="value",
@@ -503,6 +512,23 @@ github.com/jlevere
             auth=auth,
             remove=options.remove,
         )
+    elif options.altsecid != None:
+        if not options.account:
+            logging.critical(
+                'Please specify an account with "--account"'
+            )
+            raise SystemExit()
+        
+        set_array_attribute(
+            ip=remoteName,
+            domain=domain,
+            target=options.account,
+            attr='altSecurityIdentities',
+            value=options.altsecid,
+            username=username,
+            auth=auth,
+            remove=options.remove
+        )
     elif options.spn != None:
         if not options.account:
             logging.critical(
@@ -510,10 +536,11 @@ github.com/jlevere
             )
             raise SystemExit()
         
-        set_spn(
+        set_array_attribute(
             ip=remoteName,
             domain=domain,
             target=options.account,
+            attr='servicePrincipalName',
             value=options.spn,
             username=username,
             auth=auth,
