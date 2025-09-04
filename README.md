@@ -56,6 +56,8 @@ Enumeration:
 Writing:
   --rbcd source         Operation to write or remove RBCD. Also used to pass in the source computer account used
                         for the attack.
+  --altsecid value      Operation to write the altSecurityIdentities attribute value, writes by default unless "
+                        --remove" is specified
   --spn value           Operation to write the servicePrincipalName attribute value, writes by default unless "
                         --remove" is specified
   --asrep               Operation to write the DONT_REQ_PREAUTH (0x400000) userAccountControl flag on a target

@@ -100,7 +100,7 @@ LDAP_PUT_FSTRING: str = """<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-e
                 <da:Change Operation="{operation}">
                     <da:AttributeType>{attribute}</da:AttributeType>
                     <da:AttributeValue>
-                        <ad:value xsi:type="xsd:{data_type}">{value}</ad:value>
+                        <ad:value xsi:type="xsd:{data_type}"><![CDATA[{value}]]></ad:value>
                     </da:AttributeValue>
                 </da:Change>
             </da:ModifyRequest>
