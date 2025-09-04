@@ -1,6 +1,7 @@
 import datetime
 import logging
 import socket
+import re
 from base64 import b64decode
 from enum import IntFlag
 from typing import Self, Type
@@ -425,6 +426,13 @@ class ADWSConnect:
             ADWSError: Raises if there is a fault in the
             soap message return by the server
         """
+
+        # handling of unescaped XML special characters in
+        # responses to ensure smooth parsing
+        m = re.search(r'<ad:value[^>]*>(X509:<[^>]+>(.*?))</ad:value>', xmlstr)
+        if m:
+            unescaped = m.groups()[0]
+            xmlstr = xmlstr.replace(unescaped, '<![CDATA[%s]]>' % unescaped)
 
         if ":Fault>" and ":Reason>" not in xmlstr:
             return ElementTree.fromstring(xmlstr)
