@@ -82,14 +82,14 @@ def _create_allow_ace(sid: LDAP_SID):
     return nace
 
 
-def getAccountDN(target: str, username: str, ip: str, domain: str, auth: ADWSAuthType):
+def getAccountDN(target: str, username: str, ip: str, domain: str, auth: ADWSAuthType, return_target_fqdn: bool = False):
     """Get the distinguishedName of a user or computer in AD using ADWS Pull"""
     get_account_query = f"(samAccountName={target})"
     pull_client = ADWSConnect.pull_client(ip, domain, username, auth)
 
     attributes: list = ["distinguishedname"]
 
-    pull_et = pull_client.pull(query=get_account_query, basedn=None, attributes=attributes)
+    pull_et = _pull_with_referral_follow(pull_client, get_account_query, None, attributes)
 
     distinguishedName_elem = None
 
@@ -106,11 +106,14 @@ def getAccountDN(target: str, username: str, ip: str, domain: str, auth: ADWSAut
     if distinguishedName_elem is None or distinguishedName_elem.text is None:
         raise RuntimeError(f"Unable to locate DN for target '{target}'")
 
+    if return_target_fqdn:
+        return distinguishedName_elem.text, pull_client._fqdn
     return distinguishedName_elem.text
 
 
 from xml.etree import ElementTree as ET
-from src.adws import ADWSConnect, ADWSError
+from src.adws import ADWSConnect, ADWSError, ADWSReferralError
+from src.ad_dns_manager_adws import _pull_with_referral_follow
 
 def delete_computer(
     machine_name: str,
@@ -126,7 +129,7 @@ def delete_computer(
 
     print("[*] Locating computer in AD...")
     try:
-        dn = getAccountDN(target=sam, username=username, ip=ip, domain=domain, auth=auth)
+        dn = getAccountDN(target=sam, username=username, ip=target_ip, domain=domain, auth=auth)
     except Exception as e:
         print(f"[-] Failed to locate machine {sam}: {e}")
         return False
@@ -137,12 +140,28 @@ def delete_computer(
 
     print(f"[+] Found DN: {dn}")
 
+    # If getAccountDN was referred to another DC in the forest, route the
+    # subsequent Delete to that DC. Otherwise AD returns InvalidRequest
+    # because the object does not exist on the original DC.
+    import socket as _socket
+    if target_fqdn and target_fqdn.lower() != ip.lower():
+        try:
+            target_ip = _socket.gethostbyname(target_fqdn)
+            print(f"[*] Routing Delete toward {target_fqdn} ({target_ip}) which hosts the account")
+        except _socket.gaierror as gai:
+            print(f"[!] Cannot resolve {target_fqdn}: {gai}. Falling back to {ip}")
+            target_ip = ip
+            target_fqdn = ip
+    else:
+        target_ip = ip
+        target_fqdn = ip
+
     msg_id = f"urn:uuid:{uuid4()}"
-    delete_payload = LDAP_DELETE_FOR_RESOURCE.format(object_dn=dn, fqdn=ip, uuid=msg_id)
+    delete_payload = LDAP_DELETE_FOR_RESOURCE.format(object_dn=dn, fqdn=target_fqdn, uuid=msg_id)
 
     print("[*] Connecting to ADWS Resource endpoint to delete object...")
 
-    client = ADWSConnect(ip, domain, username, auth, "Resource")
+    client = ADWSConnect(target_ip, domain, username, auth, "Resource")
     try:
         client._nmf.send(delete_payload)
         response = client._nmf.recv()
@@ -271,15 +290,48 @@ def add_computer(
             "      </AttributeTypeAndValue>\n"
         )
 
+    # Discover the DC that hosts the target container. In multi-DC forests
+    # the DC the operator connected to may not host the domain partition
+    # where the account is to be created. Do a lightweight pull on the
+    # container to trigger the referral, then route the Create there.
+    import socket as _socket
+    discovery_pull = ADWSConnect.pull_client(ip, domain, username, auth)
+    try:
+        _pull_with_referral_follow(
+            discovery_pull,
+            "(objectClass=*)",
+            container_dn,
+            ["distinguishedName"],
+        )
+        target_fqdn = discovery_pull._fqdn
+    except Exception as e:
+        logging.warning(
+            f"[!] Cannot discover DC hosting {container_dn}: {e}. "
+            f"Trying original DC {ip}."
+        )
+        target_fqdn = ip
+
+    if target_fqdn.lower() != ip.lower():
+        try:
+            target_ip = _socket.gethostbyname(target_fqdn)
+            print(f"[*] Routing Create toward {target_fqdn} ({target_ip}) which hosts the target container")
+        except _socket.gaierror as gai:
+            print(f"[!] Cannot resolve {target_fqdn}: {gai}. Falling back to {ip}.")
+            target_ip = ip
+            target_fqdn = ip
+    else:
+        target_ip = ip
+        target_fqdn = ip
+
     msg_id = f"urn:uuid:{uuid4()}"
 
     addrequest_payload = LDAP_CREATE_FOR_RESOURCEFACTORY.format(
         uuid=msg_id,
-        fqdn=ip,
+        fqdn=target_fqdn,
         atav_xml=atav_xml
     )
 
-    client = ADWSConnect(ip, domain, username, auth, "ResourceFactory")
+    client = ADWSConnect(target_ip, domain, username, auth, "ResourceFactory")
     client._nmf.send(addrequest_payload)
     response = client._nmf.recv()
 
@@ -289,7 +341,7 @@ def add_computer(
 
     logging.info("AddRequest successful. Locating newly created object...")
 
-    dn = getAccountDN(target=sam, username=username, ip=ip, domain=domain, auth=auth)
+    dn = getAccountDN(target=sam, username=username, ip=target_ip, domain=domain, auth=auth)
     if not dn:
         raise RuntimeError("Failed to locate DN of the newly created computer.")
 
