@@ -574,6 +574,161 @@ def disable_machine_account(
     return True
 
 
+# ── Writing helpers ────────────────────────────────────────────────────────────
+
+def set_account_control(
+    target: str,
+    enabled: bool,
+    username: str,
+    ip: str,
+    domain: str,
+    auth: ADWSAuthType,
+) -> bool:
+    """Enable or disable a user or computer account via userAccountControl.
+
+    Toggles the ACCOUNTDISABLE flag (0x2). Unlike disable_machine_account(),
+    this function works on both user and computer objects without requiring a
+    trailing '$' and supports both directions (enable and disable).
+
+    Requires GenericWrite or WriteProperty on userAccountControl.
+    """
+    verb = "enable" if enabled else "disable"
+    print(f"[*] Attempting to {verb} account: {target}")
+
+    pull_client = ADWSConnect.pull_client(ip, domain, username, auth)
+    try:
+        pull_et = pull_client.pull(
+            query=f"(sAMAccountName={target})",
+            basedn=None,
+            attributes=["userAccountControl", "distinguishedName"],
+        )
+    except Exception as e:
+        print(f"[-] Failed LDAP pull for {target}: {e}")
+        return False
+
+    uac = None
+    dn  = None
+    for tag in [".//addata:user", ".//addata:computer"]:
+        for item in pull_et.findall(tag, namespaces=NAMESPACES):
+            uac_el = item.find(".//addata:userAccountControl/ad:value", namespaces=NAMESPACES)
+            dn_el  = item.find(".//addata:distinguishedName/ad:value",  namespaces=NAMESPACES)
+            if uac_el is not None and uac_el.text:
+                uac = int(uac_el.text)
+            if dn_el is not None and dn_el.text:
+                dn = dn_el.text
+        if uac is not None and dn is not None:
+            break
+
+    if dn is None or uac is None:
+        print(f"[-] Unable to locate {target}")
+        return False
+
+    ACCOUNTDISABLE = 0x2
+    currently_disabled = bool(uac & ACCOUNTDISABLE)
+
+    if enabled and not currently_disabled:
+        print(f"[-] Account {target} is already enabled.")
+        return True
+    if not enabled and currently_disabled:
+        print(f"[-] Account {target} is already disabled.")
+        return True
+
+    new_uac = (uac & ~ACCOUNTDISABLE) if enabled else (uac | ACCOUNTDISABLE)
+    try:
+        put_client = ADWSConnect.put_client(ip, domain, username, auth)
+        put_client.put(
+            object_ref=dn,
+            operation="replace",
+            attribute="addata:userAccountControl",
+            data_type="string",
+            value=new_uac,
+        )
+    except Exception as e:
+        print(f"[-] Failed to update userAccountControl for {target}: {e}")
+        return False
+
+    print(f"[+] Account {target} successfully {'enabled' if enabled else 'disabled'} "
+          f"(UAC: {uac} -> {new_uac}).")
+    return True
+
+
+def set_group_membership(
+    group: str,
+    member: str,
+    username: str,
+    ip: str,
+    domain: str,
+    auth: ADWSAuthType,
+    remove: bool = False,
+) -> bool:
+    """Add or remove a principal from a group's member attribute over ADWS.
+
+    Works for both privileged adds (caller has WriteProperty on the group)
+    and the AddSelf / Self-Membership scenario (caller == member and holds
+    the Self validated-write ACE), because the ACL check is enforced
+    server-side when the put is applied.
+
+    Handles ENTRY_EXISTS gracefully when adding an already-present member,
+    and ENTRY_NOT_FOUND when removing a non-member.
+    """
+    verb = "remove" if remove else "add"
+    print(f"[*] Attempting to {verb} {member} {'from' if remove else 'to'} group {group}")
+
+    pull_client = ADWSConnect.pull_client(ip, domain, username, auth)
+    try:
+        pull_et = pull_client.pull(
+            query=f"(|(sAMAccountName={group})(sAMAccountName={member}))",
+            basedn=None,
+            attributes=["sAMAccountName", "distinguishedName"],
+        )
+    except Exception as e:
+        print(f"[-] Failed LDAP pull for {group}/{member}: {e}")
+        return False
+
+    group_dn  = None
+    member_dn = None
+    for tag in [".//addata:group", ".//addata:user", ".//addata:computer"]:
+        for item in pull_et.findall(tag, namespaces=NAMESPACES):
+            sam_el = item.find(".//addata:sAMAccountName/ad:value", namespaces=NAMESPACES)
+            dn_el  = item.find(".//addata:distinguishedName/ad:value", namespaces=NAMESPACES)
+            if sam_el is None or dn_el is None or not sam_el.text or not dn_el.text:
+                continue
+            if sam_el.text.casefold() == group.casefold() and group_dn is None:
+                group_dn = dn_el.text
+            if sam_el.text.casefold() == member.casefold() and member_dn is None:
+                member_dn = dn_el.text
+
+    if group_dn is None:
+        print(f"[-] Unable to locate DN for group {group}")
+        return False
+    if member_dn is None:
+        print(f"[-] Unable to locate DN for member {member}")
+        return False
+
+    try:
+        put_client = ADWSConnect.put_client(ip, domain, username, auth)
+        put_client.put(
+            object_ref=group_dn,
+            operation="delete" if remove else "add",
+            attribute="addata:member",
+            data_type="string",
+            value=member_dn,
+        )
+    except Exception as e:
+        err = str(e)
+        if "ENTRY_EXISTS" in err or "The object exists" in err:
+            print(f"[~] {member} is already a member of {group} — no change needed.")
+            return True
+        if remove and ("ENTRY_NOT_FOUND" in err or "No Such Attribute" in err):
+            print(f"[~] {member} is not a member of {group} — nothing to remove.")
+            return True
+        print(f"[-] Failed to write member attribute on {group}: {e}")
+        return False
+
+    print(f"[+] {member_dn} {'removed from' if remove else 'added to'} {group_dn} successfully!")
+    return True
+
+
 def bind_adws(
     username: str,
     ip: str,
@@ -688,6 +843,18 @@ github.com/jlevere
     writing.add_argument("--ou", action="store", metavar="ou", help="DN of the OU where to create the computer")
     writing.add_argument("--delete-computer", action="store", metavar="MACHINE", help="Delete an existing computer account")
     writing.add_argument("--disable-account", action="store", metavar="MACHINE", help="Disable a computer account")
+
+    # Account enable / disable (generic — works on users and computers)
+    writing.add_argument("--user-account-control", action="store", metavar="ACTION",
+                         choices=["enable", "disable"],
+                         help="Enable or disable a user or computer account (use with --account)")
+
+    # Group membership
+    writing.add_argument("--group-member", action="store", metavar="ACTION",
+                         choices=["add", "remove"],
+                         help="Add or remove --account from --group")
+    writing.add_argument("--group", action="store", metavar="GROUP",
+                         help="Target group sAMAccountName for --group-member")
 
     # Shadow Credentials options
     writing.add_argument("--shadow-creds", action="store", metavar="ACTION",
@@ -961,6 +1128,38 @@ github.com/jlevere
                 ip=remoteName,
                 domain=domain,
                 auth=auth,
+            )
+
+        # Enable / disable any user or computer account
+        elif options.user_account_control:
+            if not options.account:
+                logging.critical('Specify the target account with "--account"')
+                raise SystemExit()
+            set_account_control(
+                target=options.account,
+                enabled=options.user_account_control == "enable",
+                username=username,
+                ip=remoteName,
+                domain=domain,
+                auth=auth,
+            )
+
+        # Group membership add / remove
+        elif options.group_member:
+            if not options.account:
+                logging.critical('Specify the target principal with "--account"')
+                raise SystemExit()
+            if not options.group:
+                logging.critical('Specify the target group with "--group"')
+                raise SystemExit()
+            set_group_membership(
+                group=options.group,
+                member=options.account,
+                username=username,
+                ip=remoteName,
+                domain=domain,
+                auth=auth,
+                remove=options.group_member == "remove",
             )
 
         # Delete computer
