@@ -1130,6 +1130,16 @@ github.com/jlevere
                     sid_queries = [(current_query, None, None)]
                     sid_query_count = 1
 
+                # In multi-DC forests, if the connected DC does not host the
+                # partition targeted by options.distinguishedname, ADWS returns
+                # a referral. We cannot swap the transport mid-enumeration
+                # because the enumeration context (enum_ctx) issued by the
+                # original DC is invalidated on the referred DC. Instead, we
+                # open a fresh pull client on the referred DC and restart the
+                # enumeration from scratch. Subsequent SID batches use the same
+                # referred client since the same referral would repeat.
+                referred_client = None
+
                 for sid_query_index, (
                     sid_query,
                     chunk_start_sid,
@@ -1143,17 +1153,64 @@ github.com/jlevere
                             file=sys.stderr,
                             flush=True,
                         )
-                    client.pull(
-                        sid_query,
-                        options.distinguishedname,
-                        attributes,
-                        print_incrementally=False,
-                        parse_values=options.parse,
-                        data_path=".soapy_data",
-                        print_results=False,
-                        start_sid=chunk_start_sid,
-                        end_sid=chunk_end_sid,
-                    )
+                    active_client = referred_client if referred_client else client
+                    try:
+                        active_client.pull(
+                            sid_query,
+                            options.distinguishedname,
+                            attributes,
+                            print_incrementally=False,
+                            parse_values=options.parse,
+                            data_path=".soapy_data",
+                            print_results=False,
+                            start_sid=chunk_start_sid,
+                            end_sid=chunk_end_sid,
+                        )
+                    except ADWSReferralError as ref_err:
+                        target_dc = ref_err.target_dc
+                        if not target_dc:
+                            print(
+                                "[!] LDAP referral without extractable DC hostname; cannot follow",
+                                file=sys.stderr, flush=True,
+                            )
+                            raise
+                        print(
+                            f"[!] LDAP referral: partition is hosted on {target_dc}",
+                            file=sys.stderr, flush=True,
+                        )
+                        print(
+                            f"[*] Restarting enumeration on {target_dc} "
+                            f"(cross-domain: the enum_ctx is invalidated on swap, "
+                            f"so a fresh Enumerate is required)",
+                            file=sys.stderr, flush=True,
+                        )
+                        import socket as _socket
+                        try:
+                            target_ip = _socket.gethostbyname(target_dc)
+                        except _socket.gaierror as _gai:
+                            print(
+                                f"[!] Cannot resolve {target_dc}: {_gai}. "
+                                f"Add an entry to /etc/hosts or use -dc {target_dc}.",
+                                file=sys.stderr, flush=True,
+                            )
+                            raise
+                        referred_client = ADWSConnect.pull_client(
+                            ip=target_ip,
+                            domain=domain,
+                            username=username,
+                            auth=auth,
+                        )
+                        referred_client.pull(
+                            sid_query,
+                            options.distinguishedname,
+                            attributes,
+                            print_incrementally=False,
+                            parse_values=options.parse,
+                            data_path=".soapy_data",
+                            print_results=False,
+                            start_sid=chunk_start_sid,
+                            end_sid=chunk_end_sid,
+                        )
 
     except Exception as e:
         logging.exception("Operation failed: %s", e)
