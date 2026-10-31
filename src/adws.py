@@ -655,6 +655,7 @@ class ADWSConnect:
         basedn: str | None,
         results: ElementTree.Element,
         page_writer: Callable[[list[ElementTree.Element]], None] | None = None,
+        debug_only: bool = False,
     ) -> None:
         for item in self._iter_response_objects(results):
             object_dn = self._get_object_distinguished_name(item)
@@ -673,6 +674,7 @@ class ADWSConnect:
                         basedn=object_dn,
                         attributes=[attr],
                         range_hints={attr: (next_low, "*")},
+                        debug_only=debug_only,
                     )
                     if enum_ctx is None:
                         break
@@ -693,12 +695,14 @@ class ADWSConnect:
                     if merged_values == 0:
                         break
 
-                    print(
+                    message = (
                         "[*] Collecting ADWS ranged data: received "
-                        f"{merged_values} additional {attr} values for {object_dn}",
-                        file=sys.stderr,
-                        flush=True,
+                        f"{merged_values} additional {attr} values for {object_dn}"
                     )
+                    if debug_only:
+                        logging.debug(message)
+                    else:
+                        print(message, file=sys.stderr, flush=True)
 
                     ranged_objects = self._iter_response_objects(ranged_page)
                     if not ranged_objects:
@@ -720,6 +724,7 @@ class ADWSConnect:
         basedn: str,
         attributes: list,
         range_hints: dict[str, tuple[int, int | str | None]] | None = None,
+        debug_only: bool = False,
     ) -> str | None:
         """Send the query and set up an enumeration context for the results
 
@@ -744,8 +749,9 @@ class ADWSConnect:
                 query_description[:997]
                 + f"... [{len(query):,} characters; remainder omitted]"
             )
-        logging.info(f"Using query: {query_description}")
-        logging.info(f"Using distingushedName: {basedn}")
+        log_query = logging.debug if debug_only else logging.info
+        log_query(f"Using query: {query_description}")
+        log_query(f"Using distingushedName: {basedn}")
 
         query_vars = {
             "uuid": str(uuid4()),
@@ -1484,6 +1490,7 @@ class ADWSConnect:
         print_results: bool = True,
         start_sid: str | None = None,
         end_sid: str | None = None,
+        debug_only: bool = False,
     ) -> ElementTree.Element:
         """Makes an LDAP query using ADWS to the specified server
 
@@ -1497,12 +1504,22 @@ class ADWSConnect:
             print_results (bool): Print LDAP objects after collection.
             start_sid (str): Inclusive lower objectSid bound.
             end_sid (str): Inclusive upper objectSid bound.
+            debug_only (bool): Show internal lookup results and progress only at DEBUG level.
 
         Returns:
             ElementTree.Element: The soap response as xml
         """
         if self._resource != "Enumeration":
             raise NotImplementedError("Pull is only supported on 'pull' clients")
+
+        if debug_only:
+            print_results = print_results and logging.getLogger().isEnabledFor(logging.DEBUG)
+
+        def report_progress(message: str) -> None:
+            if debug_only:
+                logging.debug(message)
+            else:
+                print(message, file=sys.stderr, flush=True)
 
         query_id = str(uuid4())
         data_file = open(data_path, "a", encoding="utf-8") if data_path is not None else None
@@ -1545,6 +1562,7 @@ class ADWSConnect:
                 query=query,
                 basedn=basedn,
                 attributes=attributes,
+                debug_only=debug_only,
             )
             if enum_ctx is None:
                 logging.error(
@@ -1565,12 +1583,14 @@ class ADWSConnect:
                     "[*] Collecting ADWS data; results will print when collection "
                     "completes"
                 )
-            else:
+            elif data_path is not None:
                 collection_message = (
                     f"[*] Collecting ADWS data into {data_path}; use --show "
                     "to print BOFHound-compatible output"
                 )
-            print(collection_message, file=sys.stderr, flush=True)
+            else:
+                collection_message = "[*] Collecting ADWS data for internal lookup"
+            report_progress(collection_message)
             more_results = True
             while more_results:
                 try:
@@ -1667,22 +1687,18 @@ class ADWSConnect:
                             results.append(unique_page)
                     collected_objects += new_objects
 
-                    print(
+                    report_progress(
                         "[*] Collecting ADWS data: "
                         f"{collected_objects} unique objects saved "
                         f"(+{new_objects} new this page; {received_objects} "
-                        f"received across {collected_pages} pages)",
-                        file=sys.stderr,
-                        flush=True,
+                        f"received across {collected_pages} pages)"
                     )
 
             write_data({"type": "base_complete", "id": query_id})
 
-            print(
+            report_progress(
                 "[*] Base ADWS collection complete: "
-                f"{collected_objects} objects; collecting ranged attribute values",
-                file=sys.stderr,
-                flush=True,
+                f"{collected_objects} objects; collecting ranged attribute values"
             )
 
             # Drain the primary enumeration before performing ranged attribute
@@ -1695,13 +1711,12 @@ class ADWSConnect:
                 basedn=basedn,
                 results=results,
                 page_writer=write_pages,
+                debug_only=debug_only,
             )
             if print_results:
-                print(
+                report_progress(
                     f"[*] ADWS data collection complete; printing {collected_objects} "
-                    "objects",
-                    file=sys.stderr,
-                    flush=True,
+                    "objects"
                 )
                 if print_incrementally:
                     self._pretty_print_response(
@@ -1713,12 +1728,10 @@ class ADWSConnect:
                     self._pretty_print_response(results, parse_values=parse_values)
 
             write_data({"type": "complete", "id": query_id})
-            if not print_results:
-                print(
+            if not print_results and data_path is not None:
+                report_progress(
                     f"[+] ADWS data collection complete: {collected_objects} "
-                    f"objects saved to {data_path}; run SOAPy --show",
-                    file=sys.stderr,
-                    flush=True,
+                    f"objects saved to {data_path}; run SOAPy --show"
                 )
             return results
         except Exception as error:

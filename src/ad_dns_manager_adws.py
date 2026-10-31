@@ -267,7 +267,7 @@ def get_rootdse_contexts(adws_client: ADWSConnect) -> Dict[str, object]:
 
 
 def _pull_with_referral_follow(pull_client, query, basedn, attributes):
-    """Run pull_client.pull with automatic LDAP referral following.
+    """Run an internal lookup with debug-only output and LDAP referral following.
 
     When the DC returns Win32ErrorCode 8235 (ERROR_DS_REFERRAL), the pull raises
     ADWSReferralError. We swap the client to the referred DC via _swap_endpoint
@@ -282,7 +282,7 @@ def _pull_with_referral_follow(pull_client, query, basedn, attributes):
     while True:
         try:
             return pull_client.pull(
-                query=query, basedn=basedn, attributes=attributes,
+                query=query, basedn=basedn, attributes=attributes, debug_only=True,
             )
         except ADWSReferralError as e:
             pull_client._swap_endpoint(e.target_dc, hops=_hops)

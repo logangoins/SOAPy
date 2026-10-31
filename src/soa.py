@@ -390,7 +390,9 @@ def set_asrep(
 
     attributes: list = ["userAccountControl", "distinguishedName"]
 
-    pull_et = pull_client.pull(query=get_accounts_queries, basedn=None, attributes=attributes)
+    pull_et = pull_client.pull(
+        query=get_accounts_queries, basedn=None, attributes=attributes, debug_only=True
+    )
     uac = None
     distinguishedName_elem = None
 
@@ -439,7 +441,9 @@ def set_rbcd(
         "msds-allowedtoactonbehalfofotheridentity",
     ]
 
-    pull_et = pull_client.pull(query=get_accounts_queries, basedn=None, attributes=attributes)
+    pull_et = pull_client.pull(
+        query=get_accounts_queries, basedn=None, attributes=attributes, debug_only=True
+    )
 
     target_sd: SR_SECURITY_DESCRIPTOR = _create_empty_sd()
     target_dn: str = ""
@@ -566,7 +570,9 @@ def disable_machine_account(
     attributes: list = ["userAccountControl", "distinguishedName"]
 
     try:
-        pull_et = pull_client.pull(query=get_accounts_queries, basedn=None, attributes=attributes)
+        pull_et = pull_client.pull(
+            query=get_accounts_queries, basedn=None, attributes=attributes, debug_only=True
+        )
     except Exception as e:
         print(f"[-] Failed LDAP pull for {sam}: {e}")
         return False
