@@ -653,7 +653,7 @@ def run_cli():
   ___) | |_| / ___ \|  __/| |_| |
  |____/ \___/_/   \_\_|    \__, |
                            |___/ 
-v1.0.0
+v1.0.0-dev
 @_logangoins
 github.com/jlevere
 """)
