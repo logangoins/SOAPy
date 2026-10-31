@@ -30,7 +30,8 @@ except ImportError:
     CRYPTOGRAPHY_AVAILABLE = False
 
 
-from src.adws import ADWSAuthType, ADWSConnect
+from src.adws import ADWSAuthType, ADWSConnect, ADWSReferralError
+from src.ad_dns_manager_adws import _pull_with_referral_follow
 from src.soap_templates import NAMESPACES
 
 
@@ -205,10 +206,9 @@ class ShadowCredentialsADWS:
         query = f"(sAMAccountName={self.target_samname})"
         pull_client = ADWSConnect.pull_client(self.ip, self.domain, self.username, self.auth)
         
-        et = pull_client.pull(
-            query=query,
-            basedn=None,
-            attributes=["distinguishedName"]
+        et = _pull_with_referral_follow(
+            pull_client, query, None,
+            ["distinguishedName"],
         )
         
         # Search in both user and computer objects
@@ -233,10 +233,9 @@ class ShadowCredentialsADWS:
         query = f"(distinguishedName={target_dn})"
         pull_client = ADWSConnect.pull_client(self.ip, self.domain, self.username, self.auth)
         
-        et = pull_client.pull(
-            query=query,
-            basedn=target_dn,
-            attributes=["msDS-KeyCredentialLink", "distinguishedName"]
+        et = _pull_with_referral_follow(
+            pull_client, query, target_dn,
+            ["msDS-KeyCredentialLink", "distinguishedName"],
         )
         
         raw_credentials = []

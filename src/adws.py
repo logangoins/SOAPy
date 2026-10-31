@@ -249,6 +249,26 @@ WELL_KNOWN_SIDS = {
 class ADWSError(Exception): ...
 
 
+class ADWSReferralError(ADWSError):
+    """Raised when the DC returns a LDAP referral (Win32ErrorCode 8235).
+
+    The DC does not host the requested partition and refers us to another
+    DC via <Referral>ldap://target-dc/target-dn</Referral>. Callers can
+    catch this exception and retry against target_dc.
+
+    Attributes:
+        target_dc: FQDN of the DC that hosts the referred partition.
+        target_dn: Distinguished name to use as base DN on target_dc.
+        original_msg: Original error text from the SOAP fault.
+    """
+
+    def __init__(self, target_dc: str, target_dn: str, original_msg: str = ""):
+        self.target_dc = target_dc
+        self.target_dn = target_dn
+        self.original_msg = original_msg
+        super().__init__(f"LDAP referral to {target_dc}: {target_dn}")
+
+
 class ADWSAuthType: ...
 
 
@@ -275,6 +295,7 @@ class NTLMAuth(ADWSAuthType):
 
 class ADWSConnect:
     SID_RANGE_QUERY_CHUNK_SIZE = 256
+    MAX_REFERRAL_HOPS = 3
 
     def __init__(
         self,
@@ -311,6 +332,61 @@ class ADWSConnect:
                 'Enumeration', AccountManagement',  'TopologyManagement'>"""
 
         self._nmf: ms_nmf.NMFConnection = self._connect(self._fqdn, self._resource)
+
+    def _swap_endpoint(self, target_dc: str, hops: int = 0) -> None:
+        """Reconnect this client to a different DC after receiving an LDAP referral.
+
+        Resolves target_dc via DNS, opens a new NMF connection against it, and
+        updates self._fqdn so subsequent SOAP payloads use the referred DC's name.
+        The old NMF is released to garbage collection.
+
+        Bounded by ADWSConnect.MAX_REFERRAL_HOPS to prevent infinite loops on
+        misconfigured multi-DC deployments.
+
+        Args:
+            target_dc: FQDN of the DC to reconnect to (from ADWSReferralError.target_dc).
+            hops: Current recursion depth (caller manages this).
+
+        Raises:
+            RuntimeError: If MAX_REFERRAL_HOPS reached or DNS resolution fails.
+        """
+        if hops >= self.MAX_REFERRAL_HOPS:
+            logging.error(
+                f"Max referral hops ({self.MAX_REFERRAL_HOPS}) reached. "
+                f"Last referral was to {target_dc}. Aborting."
+            )
+            raise RuntimeError(
+                f"Max referral hops ({self.MAX_REFERRAL_HOPS}) reached"
+            )
+
+        logging.warning(
+            f"LDAP referral (hop {hops + 1}/{self.MAX_REFERRAL_HOPS}): "
+            f"following to {target_dc}"
+        )
+
+        try:
+            target_ip = socket.gethostbyname(target_dc)
+        except socket.gaierror as gai:
+            logging.error(
+                f"Cannot resolve referred DC {target_dc}: {gai}. "
+                f"Add it to /etc/hosts or point -dc to a DC that hosts "
+                f"the target partition directly."
+            )
+            raise RuntimeError(
+                f"Cannot resolve referred DC {target_dc}"
+            ) from gai
+
+        logging.info(
+            f"Reconnecting to {target_dc} ({target_ip})"
+        )
+
+        # Update self._fqdn BEFORE reconnecting - _create_NNS_from_auth uses
+        # self._fqdn to build the NNS/Kerberos target.
+        self._fqdn = target_dc
+
+        # Open new NMF connection to the referred DC. The old self._nmf will
+        # be released to GC when we reassign below.
+        self._nmf = self._connect(target_ip, self._resource)
 
     def _create_NNS_from_auth(self, sock: socket.socket) -> NNS:
         if isinstance(self._auth, NTLMAuth):
@@ -1019,6 +1095,21 @@ class ADWSConnect:
         else:
             detail_xmlstr = ""
 
+        # Detect LDAP referrals (Win32ErrorCode 8235). The DC does not host
+        # the requested partition. Raise a specialized exception so callers
+        # can catch and retry against the referred DC.
+        referral_match = re.search(
+            r"<[^>]*:?Referral>\s*ldap://([^/]+)/([^<]+)\s*</[^>]*:?Referral>",
+            detail_xmlstr,
+        )
+        win32_match = re.search(r"<[^>]*:?Win32ErrorCode>\s*(\d+)\s*<", detail_xmlstr)
+        if referral_match and win32_match and win32_match.group(1) == "8235":
+            raise ADWSReferralError(
+                target_dc=referral_match.group(1).strip(),
+                target_dn=referral_match.group(2).strip(),
+                original_msg=base_msg + detail_xmlstr,
+            )
+
         raise ADWSError(base_msg + detail_xmlstr)
 
     def _get_tag_name(self, elem: ElementTree.Element) -> str:
@@ -1355,9 +1446,22 @@ class ADWSConnect:
 
         put_msg = LDAP_PUT_FSTRING.format(**put_vars)
 
-        self._nmf.send(put_msg)
-        resp_str = self._nmf.recv()
-        et = self._handle_str_to_xml(resp_str)
+        # Retry loop for LDAP referrals. The DC may not host the requested
+        # partition and refer us to one that does. _swap_endpoint reconnects
+        # this client to the referred DC and updates self._fqdn so we can
+        # rebuild the payload with the new fqdn before retrying.
+        _hops = 0
+        while True:
+            self._nmf.send(put_msg)
+            resp_str = self._nmf.recv()
+            try:
+                et = self._handle_str_to_xml(resp_str)
+                break
+            except ADWSReferralError as _referral:
+                self._swap_endpoint(_referral.target_dc, hops=_hops)
+                _hops += 1
+                put_vars["fqdn"] = self._fqdn
+                put_msg = LDAP_PUT_FSTRING.format(**put_vars)
         if not et:
             raise ValueError("was unable to parse xml from the server response")
 

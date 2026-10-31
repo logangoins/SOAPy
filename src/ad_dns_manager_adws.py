@@ -10,7 +10,8 @@ from typing import Tuple, List, Dict, Optional
 import dns.resolver
 from impacket.structure import Structure
 
-from src.adws import ADWSAuthType, ADWSConnect
+import logging
+from src.adws import ADWSAuthType, ADWSConnect, ADWSReferralError
 # SOAP/XML templates and namespaces moved to src.soap_templates to keep this file lean.
 from src.soap_templates import (
     NAMESPACES,
@@ -261,6 +262,33 @@ def get_rootdse_contexts(adws_client: ADWSConnect) -> Dict[str, object]:
 # dnsNode discovery and builders
 # -----------------------
 
+
+
+
+
+def _pull_with_referral_follow(pull_client, query, basedn, attributes):
+    """Run pull_client.pull with automatic LDAP referral following.
+
+    When the DC returns Win32ErrorCode 8235 (ERROR_DS_REFERRAL), the pull raises
+    ADWSReferralError. We swap the client to the referred DC via _swap_endpoint
+    and restart the pull. The enumeration context created on the original DC is
+    no longer valid on the referred DC, so we must restart from scratch (not
+    just retry the same Pull request).
+
+    Bounded by ADWSConnect.MAX_REFERRAL_HOPS to prevent infinite loops on
+    misconfigured multi-DC deployments.
+    """
+    _hops = 0
+    while True:
+        try:
+            return pull_client.pull(
+                query=query, basedn=basedn, attributes=attributes,
+            )
+        except ADWSReferralError as e:
+            pull_client._swap_endpoint(e.target_dc, hops=_hops)
+            _hops += 1
+
+
 def find_dns_node(
     target: str,
     zone: str,
@@ -305,10 +333,16 @@ def find_dns_node(
         pull_client = ADWSConnect.pull_client(ip, domain, username, auth)
 
     try:
-        et = pull_client.pull(query=query, basedn=searchtarget, attributes=["dnsRecord", "dNSTombstoned", "distinguishedName", "name"])
+        et = _pull_with_referral_follow(
+            pull_client, query, searchtarget,
+            ["dnsRecord", "dNSTombstoned", "distinguishedName", "name"],
+        )
     except Exception:
         # fallback to a broader search under dnsroot if the constructed base didn't match
-        et = pull_client.pull(query=query, basedn=dnsroot, attributes=["dnsRecord", "dNSTombstoned", "distinguishedName", "name"])
+        et = _pull_with_referral_follow(
+            pull_client, query, dnsroot,
+            ["dnsRecord", "dNSTombstoned", "distinguishedName", "name"],
+        )
 
     node_dn: Optional[str] = None
     raw_records: List[bytes] = []
@@ -407,19 +441,41 @@ def _set_dnstombstoned_replace_boolean(resource_client: ADWSConnect, object_ref:
         value=val,
     )
 
-    # send and receive raw response
-    try:
-        resource_client._nmf.send(payload)
-        raw = resource_client._nmf.recv()
-    except Exception as e:
-        print(f"[ERROR] transport error sending Replace dNSTombstoned: {e}")
-        return False
-
-    # try to parse and show response for debugging
-    try:
-        et = resource_client._handle_str_to_xml(raw)
-    except Exception:
-        et = None
+    # send and receive raw response, with retry on LDAP referral.
+    # If the target DC does not host the partition, _swap_endpoint reconnects
+    # resource_client to the referred DC and we rebuild the payload with its fqdn.
+    et = None
+    raw = ""
+    _hops = 0
+    while True:
+        try:
+            resource_client._nmf.send(payload)
+            raw = resource_client._nmf.recv()
+        except Exception as e:
+            print(f"[ERROR] transport error sending Replace dNSTombstoned: {e}")
+            return False
+        try:
+            et = resource_client._handle_str_to_xml(raw)
+            break
+        except ADWSReferralError as _referral:
+            try:
+                resource_client._swap_endpoint(_referral.target_dc, hops=_hops)
+            except Exception as e:
+                print(f"[ERROR] referral follow failed: {e}")
+                return False
+            _hops += 1
+            payload = LDAP_PUT_FSTRING.format(
+                uuid=_make_msgid(),
+                fqdn=resource_client._fqdn,
+                object_ref=object_ref,
+                operation="replace",
+                attribute="addata:dNSTombstoned",
+                data_type="boolean",
+                value=val,
+            )
+        except Exception:
+            et = None
+            break
 
     s = raw if isinstance(raw, str) else raw.decode(errors="ignore")
     print("[DEBUG] Replace dNSTombstoned response (truncated):")
@@ -531,11 +587,40 @@ def add_dns_record_adws(
     domain_dn = ",".join([f"DC={p}" for p in domain_parts])
     container_root = f"CN=MicrosoftDNS,DC=DomainDnsZones,{domain_dn}"
 
-    # enumerate dnsZone objects and pick the correct one (reuse pull_client)
+    # enumerate dnsZone objects and pick the correct one (reuse pull_client).
+    # ADWSConnect.pull() handles LDAP referrals transparently via
+    # _request_with_retries + _swap_endpoint: if the target DC does not host
+    # the DomainDnsZones partition, the underlying request layer swaps this
+    # client to the referred DC and retries automatically.
     try:
-        et_zones = pull_client.pull(query="(objectClass=dnsZone)", basedn=container_root, attributes=["distinguishedName"])
+        et_zones = _pull_with_referral_follow(
+            pull_client, "(objectClass=dnsZone)", container_root,
+            ["distinguishedName"],
+        )
     except Exception as e:
         raise RuntimeError(f"Failed to enumerate dnsZone under {container_root}: {e}")
+
+    # If the pull was referred to another DC (multi-DC forest), the pull_client
+    # has been swapped to that DC. Use its fqdn for the subsequent Create,
+    # otherwise AD returns CouldntFindParentObjectForCreation because the
+    # parent container does not exist on the original DC.
+    create_target_fqdn = pull_client._fqdn
+    if create_target_fqdn != resource_client._fqdn:
+        try:
+            create_target_ip = socket.gethostbyname(create_target_fqdn)
+            logging.info(
+                f"Routing Create toward {create_target_fqdn} ({create_target_ip}) "
+                f"which hosts the DomainDnsZones partition"
+            )
+        except socket.gaierror as gai:
+            logging.warning(
+                f"Cannot resolve {create_target_fqdn} for Create routing: {gai}. "
+                f"Falling back to original DC {ip}."
+            )
+            create_target_ip = ip
+            create_target_fqdn = resource_client._fqdn
+    else:
+        create_target_ip = ip
 
     zone_dns = []
     for elem in et_zones.findall(".//addata:distinguishedName/ad:value", namespaces=NAMESPACES):
@@ -636,7 +721,7 @@ def add_dns_record_adws(
         msg_id = _make_msgid()
         create_payload = LDAP_CREATE_FOR_RESOURCEFACTORY.format(
             uuid=msg_id,
-            fqdn=resource_client._fqdn,
+            fqdn=create_target_fqdn,
             atav_xml=atav_xml,
             container_dn=valid_container,
             object_class="dnsNode",
@@ -646,10 +731,28 @@ def add_dns_record_adws(
         # print("[DEBUG] Create payload (RDN=%s):\n%s" % (rdn, create_payload))
 
         try:
-            rf_client = ADWSConnect(ip, domain, username, auth, "ResourceFactory")
-            rf_client._nmf.send(create_payload)
-            response = rf_client._nmf.recv()
-            et = rf_client._handle_str_to_xml(response)
+            rf_client = ADWSConnect(create_target_ip, domain, username, auth, "ResourceFactory")
+            # Retry loop for LDAP referrals: if the target DC does not host the
+            # DomainDnsZones partition, _swap_endpoint reconnects rf_client to
+            # the referred DC and we rebuild the payload with its fqdn.
+            _hops = 0
+            while True:
+                rf_client._nmf.send(create_payload)
+                response = rf_client._nmf.recv()
+                try:
+                    et = rf_client._handle_str_to_xml(response)
+                    break
+                except ADWSReferralError as _referral:
+                    rf_client._swap_endpoint(_referral.target_dc, hops=_hops)
+                    _hops += 1
+                    # Rebuild payload with new fqdn (rf_client._fqdn was updated by _swap_endpoint)
+                    create_payload = LDAP_CREATE_FOR_RESOURCEFACTORY.format(
+                        uuid=str(uuid4()),
+                        fqdn=rf_client._fqdn,
+                        atav_xml=atav_xml,
+                        container_dn=valid_container,
+                        object_class="dnsNode",
+                    )
             if et is None:
                 raise RuntimeError("Create/AddRequest returned empty or malformed response")
             new_dn = f"{rdn},{valid_container}"
@@ -779,11 +882,26 @@ def remove_dns_record_adws(
         delete_payload = LDAP_DELETE_FOR_RESOURCE.format(
             object_dn=node_dn,
             uuid=msg_id,
-            fqdn=ip,
+            fqdn=resource_client._fqdn,
         )
-        resource_client._nmf.send(delete_payload)
-        response = resource_client._nmf.recv()
-        et = resource_client._handle_str_to_xml(response)
+        # Retry loop for LDAP referrals: if the target DC does not host the
+        # DomainDnsZones partition, _swap_endpoint reconnects resource_client
+        # to the referred DC and we rebuild the payload with its fqdn.
+        _hops = 0
+        while True:
+            resource_client._nmf.send(delete_payload)
+            response = resource_client._nmf.recv()
+            try:
+                et = resource_client._handle_str_to_xml(response)
+                break
+            except ADWSReferralError as _referral:
+                resource_client._swap_endpoint(_referral.target_dc, hops=_hops)
+                _hops += 1
+                delete_payload = LDAP_DELETE_FOR_RESOURCE.format(
+                    object_dn=node_dn,
+                    uuid=_make_msgid(),
+                    fqdn=resource_client._fqdn,
+                )
         if et is None:
             raise RuntimeError("DeleteResponse empty/malformed")
         print(f"[+] Deleted dnsNode {node_dn} via ADWS Resource Delete")
